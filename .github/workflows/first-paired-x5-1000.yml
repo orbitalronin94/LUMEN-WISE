@@ -23,9 +23,8 @@ env:
   MKL_DYNAMIC: "FALSE"
   OMP_WAIT_POLICY: "PASSIVE"
   SOURCE_REPOSITORY: "orbitalronin94/WISE-RONIN"
-  SOURCE_ARTIFACT_ID: "15024245779"
-  SOURCE_ARTIFACT_SHA256: "f8d136abae6a1312d9f2ce49efb1418e7a11c49e0dccd64837e152f5f4c6cd27"
-  SOURCE_RUN_ID: "45618840019"
+  SOURCE_RELEASE_URL: "https://github.com/orbitalronin94/WISE-RONIN/releases/download/corpus-v4.0.0-public-20261125/wise-ronin-corpus-v4.0.0.zip"
+  SOURCE_RELEASE_SHA256: "535ae5a1c067f30a93e1ad20e0a8b7e332df5b14558d1dfac7a3e44193de3e9a"
   TOKENIZER_SHA256: "d7869c11809a28085d5156638086c4833a1dcbacfda4a60b69ec71e26ed3fefe"
 
 jobs:
@@ -34,17 +33,14 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      - name: Download the immutable public V4 artifact
+      - name: Download the public V4 release asset (no credentials)
         shell: bash
         run: |
           set -euo pipefail
           curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${SOURCE_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
-            --output corpus-v4.zip
-          echo "${SOURCE_ARTIFACT_SHA256}  corpus-v4.zip" | sha256sum --check
-          mkdir corpus
-          unzip -q corpus-v4.zip -d corpus
+            "${SOURCE_RELEASE_URL}" --output corpus-v4.zip
+          echo "${SOURCE_RELEASE_SHA256}  corpus-v4.zip" | sha256sum --check
+          unzip -q corpus-v4.zip
           test -s corpus/manifest.json
           test -s corpus/tokenizer.json
 
@@ -77,7 +73,7 @@ jobs:
               assert digest.hexdigest() == shard["sha256"], shard["file"]
               total_rows += int(shard["rows"])
           assert total_rows == int(manifest["total_rows"]) == 2_293_883, total_rows
-          print(f"FROZEN_V4_OK run=${{env.SOURCE_RUN_ID}} rows={total_rows} shards={len(shards)} tokenizer={expected_tokenizer}")
+          print(f"FROZEN_V4_OK public_release=true rows={total_rows} shards={len(shards)} tokenizer={expected_tokenizer}")
           PY
 
       - name: Publish verified V4 inputs for both independent model jobs
