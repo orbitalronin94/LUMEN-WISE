@@ -1,0 +1,11 @@
+{
+  "threads": 4,
+  "interop_threads": 2,
+  "mkldnn_enabled": true,
+  "foreach": false,
+  "cpu_affinity": true,
+  "delta_pre_normalize": false,
+  "homeostasis_fused_scatter": false,
+  "profile_id": "measured_cpu_winner_4x2_v1",
+  "note": "Alias profile retained for existing workflows; uses the measured four-thread CPU settings and disables both slower experimental fastpaths."
+}
