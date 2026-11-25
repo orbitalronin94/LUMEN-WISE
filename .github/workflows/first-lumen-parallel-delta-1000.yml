@@ -2,6 +2,10 @@ name: LUMEN-WISE — parallel Delta fast-path trial (1000 steps)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/first-lumen-parallel-delta-1000.yml
 
 permissions:
   contents: read
