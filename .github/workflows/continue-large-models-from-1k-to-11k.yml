@@ -1,0 +1,270 @@
+name: LUMEN-WISE — continue both large models from exact 1k checkpoints to 11k
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/continue-large-models-from-1k-to-11k.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: lumen-wise-large-models-continue-1k-to-11k
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  OMP_DYNAMIC: "FALSE"
+  MKL_DYNAMIC: "FALSE"
+  OMP_WAIT_POLICY: "PASSIVE"
+  SOURCE_RUN_ID: "45641829810"
+  SOURCE_RELEASE_URL: "https://github.com/orbitalronin94/WISE-RONIN/releases/download/corpus-v4.0.0-public-20261125/wise-ronin-corpus-v4.0.0.zip"
+  SOURCE_RELEASE_SHA256: "535ae5a1c067f30a93e1ad20e0a8b7e332df5b14558d1dfac7a3e44193de3e9a"
+  TOKENIZER_SHA256: "d7869c11809a28085d5156638086c4833a1dcbacfda4a60b69ec71e26ed3fefe"
+  DATA_SHA256: "b5296e0976a7c02536dcab08796103c8ebb17da501ce80451410110c45a03692"
+
+jobs:
+  prepare-v4:
+    name: Import and verify frozen V4 corpus
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Download public V4 release (no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            "${SOURCE_RELEASE_URL}" --output corpus-v4.zip
+          echo "${SOURCE_RELEASE_SHA256}  corpus-v4.zip" | sha256sum --check
+          unzip -q corpus-v4.zip
+          test -s corpus/manifest.json
+          test -s corpus/tokenizer.json
+      - name: Verify frozen corpus and all shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path("corpus")
+          manifest = json.loads((root / "manifest.json").read_text())
+          expected = "${{ env.TOKENIZER_SHA256 }}"
+          assert manifest["version"] == "v4.0.0"
+          assert manifest["status"] == "FROZEN_TRAINABLE"
+          assert manifest["training_authorized"] is True
+          assert manifest["tokenizer_sha256"] == expected
+          assert hashlib.sha256((root / "tokenizer.json").read_bytes()).hexdigest() == expected
+          assert len(manifest["shards"]) == 24
+          rows = 0
+          for shard in manifest["shards"]:
+              p = root / shard["file"]
+              assert p.is_file() and p.stat().st_size == int(shard["bytes"])
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              assert h.hexdigest() == shard["sha256"], shard["file"]
+              rows += int(shard["rows"])
+          assert rows == int(manifest["total_rows"]) == 2_293_883
+          print(f"V4_OK rows={rows} shards=24 tokenizer={expected}")
+          PY
+      - name: Publish verified V4 corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-v4-continue-1k-11k-${{ github.run_id }}
+          path: corpus/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
+
+  train-lumen:
+    name: Continue LUMEN x5 — exact parent 1000 to 11000 — CPU 4/2
+    needs: prepare-v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-v4-continue-1k-11k-${{ github.run_id }}
+          path: corpus
+      - name: Download exact LUMEN step-1000 checkpoint and its original configs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-eager-delta1-fused-4x2-lean-step1000-${{ env.SOURCE_RUN_ID }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: parent/lumen
+      - name: Install CPU training runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "numpy>=1.26,<3" "tokenizers>=0.20,<1.0" "tqdm>=4.66,<5"
+      - name: Verify exact parent, corpus lineage and preserved LUMEN profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, torch
+          from pathlib import Path
+          parent = Path("parent/lumen/checkpoints/lumen/step_1000.pt")
+          assert parent.is_file() and parent.stat().st_size > 0
+          state = torch.load(parent, map_location="cpu", weights_only=False)
+          assert int(state["step"]) == 1000
+          assert int(state["params"]) == 11_231_405, state["params"]
+          assert state["phase"] == 1 and state["pilot_all_rows"] is True
+          assert state["v32_ze"] is False
+          assert state["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert state["data_sha256"] == "${{ env.DATA_SHA256 }}"
+          assert all(state.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng"))
+          assert int(state["training_config"]["total_steps"]) == 1000
+          cfg = json.loads(Path("parent/lumen/config/lumen_wise_x5_parallel1000.json").read_text())
+          profile = json.loads(Path("parent/lumen/config/lumen_cpu_profile_eager_delta1_fused1000.json").read_text())
+          assert profile["threads"] == 4 and profile["interop_threads"] == 2
+          assert profile["delta_parallel_refinements"] == 1
+          assert profile["homeostasis_fused_scatter"] is True
+          assert profile["organs"]["pain"]["response"] == 0.2
+          assert profile["organs"]["pleasure"]["response"] == 0.5
+          assert profile["organs"]["pain_budget_gain"] == 0.15
+          assert profile["organs"]["pleasure_budget_gain"] == 0.15
+          assert profile["plasticity"]["mode"] == "custom"
+          print("LUMEN_PARENT_OK step=1000 params=11231405 optimizer=saved scheduler=saved rng=saved")
+          print("LUMEN_PROFILE_OK organs=preserved plasticity=preserved delta1=fused eager=true cpu=4/2")
+          PY
+          mkdir -p checkpoints/lumen logs
+      - name: Continue LUMEN for exactly 10000 updates (global 1001–11000)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m train.train \
+            --steps 10000 --phase 1 --pilot-all-rows \
+            --resume parent/lumen/checkpoints/lumen/step_1000.pt \
+            --data corpus --tokenizer corpus/tokenizer.json \
+            --batch 8 --max-len 128 --seed 42 \
+            --disable-mkldnn --disable-foreach --cpu-affinity \
+            --lr 3e-5 --warmup 100 --total-steps 11000 \
+            --scheduler-transition --transition-start 1000 --transition-end 11000 \
+            --warmup-transition 100 --transition-min-lr-ratio 0.05 \
+            --log-every 100 --checkpoint-every 1000 \
+            --recovery-checkpoint-every 250 --parameter-check-every 500 \
+            --ckpt-dir checkpoints/lumen \
+            --model-config parent/lumen/config/lumen_wise_x5_parallel1000.json \
+            --runtime-profile parent/lumen/config/lumen_cpu_profile_eager_delta1_fused1000.json \
+            2>&1 | tee logs/lumen-continue-1k-to-11k.log
+      - name: Verify exact LUMEN step-11000 checkpoint
+        run: |
+          python - <<'PY'
+          import torch
+          s = torch.load("checkpoints/lumen/step_11000.pt", map_location="cpu", weights_only=False)
+          assert int(s["step"]) == 11000
+          assert int(s["params"]) == 11_231_405
+          assert s["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert s["data_sha256"] == "${{ env.DATA_SHA256 }}"
+          assert all(s.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng"))
+          assert s["v32_ze"] is False and s["pilot_all_rows"] is True
+          assert s["runtime_profile"]["delta_parallel_refinements"] == 1
+          assert s["runtime_profile"]["homeostasis_fused_scatter"] is True
+          print("LUMEN_STEP11000_OK")
+          PY
+      - name: Upload LUMEN continuation checkpoints and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-large-lumen-step11000-${{ github.run_id }}
+          path: |
+            checkpoints/lumen/
+            logs/
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 1
+
+  train-transformer:
+    name: Continue Transformer x5 — exact parent 1000 to 11000 — CPU 4/2
+    needs: prepare-v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-v4-continue-1k-11k-${{ github.run_id }}
+          path: corpus
+      - name: Download exact Transformer step-1000 checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-transformer-x5-4x2-lean-step1000-${{ env.SOURCE_RUN_ID }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: parent/transformer
+      - name: Install CPU training runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "numpy>=1.26,<3" "tokenizers>=0.20,<1.0" "tqdm>=4.66,<5"
+      - name: Verify exact Transformer parent and corpus lineage
+        run: |
+          python - <<'PY'
+          import torch
+          s = torch.load("parent/transformer/checkpoints/transformer/step_1000.pt", map_location="cpu", weights_only=False)
+          assert int(s["step"]) == 1000
+          assert int(s["params"]) == 12_022_016
+          assert s["architecture_id"] == "decoder_transformer_4l_d488_h8_ff1569_rg51_tied_v2"
+          assert s["model_spec"] == {"model_dim": 488, "heads": 8, "ff_width": 1569, "residual_groups": 51, "layers": 4, "tied_embeddings": True}
+          assert s["seed"] == 42 and s["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert s["data_sha256"] == "${{ env.DATA_SHA256 }}"
+          assert int(s["training_config"]["total_steps"]) == 1000
+          assert all(s.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng"))
+          print("TRANSFORMER_PARENT_OK step=1000 params=12022016 optimizer=saved scheduler=saved rng=saved")
+          PY
+          mkdir -p checkpoints/transformer logs
+      - name: Continue Transformer for exactly 10000 updates (global 1001–11000)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m train.transformer_baseline --steps 10000 \
+            --resume parent/transformer/checkpoints/transformer/step_1000.pt \
+            --data corpus --tokenizer corpus/tokenizer.json \
+            --batch 8 --max-len 128 --seed 42 --threads 4 --interop-threads 2 \
+            --disable-mkldnn --disable-foreach --cpu-affinity \
+            --lr 3e-5 --warmup 100 --total-steps 11000 \
+            --scheduler-transition --transition-start 1000 --transition-end 11000 \
+            --warmup-transition 100 --transition-min-lr-ratio 0.05 \
+            --checkpoint-every 1000 --parameter-check-every 500 \
+            --ckpt-dir checkpoints/transformer \
+            --model-dim 488 --heads 8 --ff-width 1569 --residual-groups 51 \
+            2>&1 | tee logs/transformer-continue-1k-to-11k.log
+      - name: Verify exact Transformer step-11000 checkpoint
+        run: |
+          python - <<'PY'
+          import torch
+          s = torch.load("checkpoints/transformer/step_11000.pt", map_location="cpu", weights_only=False)
+          assert int(s["step"]) == 11000 and int(s["params"]) == 12_022_016
+          assert s["architecture_id"] == "decoder_transformer_4l_d488_h8_ff1569_rg51_tied_v2"
+          assert s["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert s["data_sha256"] == "${{ env.DATA_SHA256 }}"
+          assert all(s.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng"))
+          print("TRANSFORMER_STEP11000_OK")
+          PY
+      - name: Upload Transformer continuation checkpoints and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-large-transformer-step11000-${{ github.run_id }}
+          path: |
+            checkpoints/transformer/
+            logs/
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 1
