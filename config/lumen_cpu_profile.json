@@ -1,0 +1,47 @@
+{
+  "threads": 4,
+  "interop_threads": 2,
+  "mkldnn_enabled": false,
+  "foreach": false,
+  "cpu_affinity": true,
+  "delta_pre_normalize": false,
+  "delta_parallel_refinements": 2,
+  "delta_reuse_write_update": true,
+  "delta_always_apply_eligibility": true,
+  "delta_trace_norm_diagnostics_on_demand": true,
+  "delta_share_causal_masks": true,
+  "homeostasis_fused_scatter": false,
+  "organs": {
+    "pain": {
+      "response": 0.2
+    },
+    "pleasure": {
+      "response": 0.5
+    },
+    "pain_budget_gain": 0.15,
+    "pleasure_budget_gain": 0.15
+  },
+  "plasticity": {
+    "mode": "custom",
+    "threshold_scale": 0.85,
+    "eligibility_retention": 0.98
+  },
+  "sleep_downscale": 0.99,
+  "sleep_interval_steps": 50,
+  "profile_id": "check0_selected_H02_H03_H04_H05_H06_H09_H18",
+  "benchmark_metadata": {
+    "source": "GitHub Actions run 45394137485, paired check-0 screening",
+    "run_url": "https://github.com/orbitalronin94/WISE-RONIN/actions/runs/45394137485",
+    "selection": [
+      "H02: pain response=0.20; speed +0.06%; mean loss delta -0.001678",
+      "H03: pleasure response=0.50; speed +2.19%; mean loss delta -0.000802",
+      "H04: pain budget gain=0.15; speed +0.26%; mean loss delta +0.002235",
+      "H05: pleasure budget gain=0.15; speed +0.58%; mean loss delta -0.003742",
+      "H06: plasticity threshold scale=0.85; speed +0.83%; mean loss unchanged",
+      "H09: eligibility retention=0.98; speed +8.40%; mean loss delta +0.000003",
+      "H18: sleep downscale=0.99, interval=50; speed +2.63%; mean loss unchanged"
+    ],
+    "selection_note": "User-selected composite screening profile. These deltas were screened independently from fresh initialization for 1,000 steps; the combined interaction is not yet validated. H18 sleep did not execute on fresh check 0 because no slow-memory records were consolidated. The 400k resumed run will determine whether H18 executes against the populated parent memory. H04 is retained by explicit user choice despite a small positive loss delta.",
+    "scope": "provisional training profile; not a claim of holdout superiority"
+  }
+}
