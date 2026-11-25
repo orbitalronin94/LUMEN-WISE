@@ -1,0 +1,185 @@
+name: LUMEN-WISE — 10-step CPU hypothesis matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/benchmark-lumen-10steps-matrix.yml'
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  SOURCE_RELEASE_URL: "https://github.com/orbitalronin94/WISE-RONIN/releases/download/corpus-v4.0.0-public-20261125/wise-ronin-corpus-v4.0.0.zip"
+  SOURCE_RELEASE_SHA256: "535ae5a1c067f30a93e1ad20e0a8b7e332df5b14558d1dfac7a3e44193de3e9a"
+  TOKENIZER_SHA256: "d7869c11809a28085d5156638086c4833a1dcbacfda4a60b69ec71e26ed3fefe"
+
+jobs:
+  prepare-v4:
+    name: Prepare shared public V4 corpus
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Download and verify public release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 "${SOURCE_RELEASE_URL}" -o corpus-v4.zip
+          echo "${SOURCE_RELEASE_SHA256}  corpus-v4.zip" | sha256sum --check
+          unzip -q corpus-v4.zip
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path("corpus")
+          m = json.loads((root/"manifest.json").read_text())
+          expected = "${{ env.TOKENIZER_SHA256 }}"
+          assert m["status"] == "FROZEN_TRAINABLE" and m["training_authorized"] is True
+          assert m["tokenizer_sha256"] == expected
+          assert hashlib.sha256((root/"tokenizer.json").read_bytes()).hexdigest() == expected
+          assert len(m["shards"]) == 24
+          total = 0
+          for item in m["shards"]:
+              p = root/item["file"]
+              assert p.is_file() and p.stat().st_size == int(item["bytes"])
+              h = hashlib.sha256(p.read_bytes()).hexdigest()
+              assert h == item["sha256"], item["file"]
+              total += int(item["rows"])
+          assert total == 2_293_883
+          print(f"CORPUS_V4_OK rows={total} shards=24 tokenizer_sha256={expected}")
+          PY
+      - name: Upload shared corpus artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-benchmark-v4-${{ github.run_id }}
+          path: corpus/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 1
+
+  benchmark:
+    name: "LUMEN 10 steps — ${{ matrix.hypothesis }}"
+    needs: prepare-v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        hypothesis:
+          - baseline
+          - threads_1
+          - threads_2
+          - interop_1
+          - mkldnn_on
+          - foreach_on
+          - affinity_off
+          - delta_refinements_1
+          - delta_refinements_4
+          - delta_reuse_off
+          - homeostasis_fused
+          - compile_reduce_overhead
+          - eager_no_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-benchmark-v4-${{ github.run_id }}
+          path: corpus
+      - name: Install CPU runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "numpy>=1.26,<3" "tokenizers>=0.20,<1.0" "tqdm>=4.66,<5"
+      - name: Build isolated hypothesis profile
+        env:
+          HYPOTHESIS: ${{ matrix.hypothesis }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results/checkpoints
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = json.loads(Path("config/lumen_cpu_profile.json").read_text())
+          h = os.environ["HYPOTHESIS"]
+          if h == "threads_1": p["threads"] = 1
+          elif h == "threads_2": p["threads"] = 2
+          elif h == "interop_1": p["interop_threads"] = 1
+          elif h == "mkldnn_on": p["mkldnn_enabled"] = True
+          elif h == "foreach_on": p["foreach"] = True
+          elif h == "affinity_off": p["cpu_affinity"] = False
+          elif h == "delta_refinements_1": p["delta_parallel_refinements"] = 1
+          elif h == "delta_refinements_4": p["delta_parallel_refinements"] = 4
+          elif h == "delta_reuse_off": p["delta_reuse_write_update"] = False
+          elif h == "homeostasis_fused": p["homeostasis_fused_scatter"] = True
+          elif h in ("baseline", "compile_reduce_overhead", "eager_no_compile"): pass
+          else: raise ValueError(f"Unknown hypothesis: {h}")
+          out = Path("benchmark-results/runtime-profile.json")
+          out.write_text(json.dumps(p, indent=2) + "\n")
+          json.loads(out.read_text())
+          print(f"HYPOTHESIS={h}")
+          print("PROFILE="+json.dumps({k:p.get(k) for k in (
+              "threads","interop_threads","mkldnn_enabled","foreach","cpu_affinity",
+              "delta_parallel_refinements","delta_reuse_write_update","homeostasis_fused_scatter"
+          )}, sort_keys=True))
+          PY
+          python -m train.train --help >/dev/null
+      - name: Run exactly 10 fresh LUMEN steps
+        env:
+          HYPOTHESIS: ${{ matrix.hypothesis }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPILE_ARGS=()
+          if [ "${HYPOTHESIS}" = "compile_reduce_overhead" ]; then COMPILE_ARGS=(--compile-mode reduce-overhead); fi
+          if [ "${HYPOTHESIS}" != "eager_no_compile" ] && [ "${HYPOTHESIS}" != "compile_reduce_overhead" ]; then COMPILE_ARGS=(--compile-mode default); fi
+          START=$(date +%s.%N)
+          python -m train.train \
+            --steps 10 --phase 1 --pilot-all-rows \
+            --data corpus --tokenizer corpus/tokenizer.json \
+            --batch 8 --max-len 128 --seed 42 \
+            --lr 3e-5 --warmup 0 --total-steps 10 \
+            --log-every 10 --checkpoint-every 10 --recovery-checkpoint-every 0 \
+            --parameter-check-every 10 --no-sleep \
+            --ckpt-dir benchmark-results/checkpoints \
+            --model-config config/lumen_wise_x5.json \
+            --runtime-profile benchmark-results/runtime-profile.json \
+            "${COMPILE_ARGS[@]}" \
+            2>&1 | tee benchmark-results/train.log
+          END=$(date +%s.%N)
+          python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          import re
+          log = Path("benchmark-results/train.log").read_text(errors="replace")
+          steps = re.findall(r"step=(\d+) loss=([0-9.eE+-]+)", log)
+          assert steps, "No step/loss records found"
+          assert int(steps[-1][0]) == 10, f"Expected final step 10, got {steps[-1][0]}"
+          wall = re.findall(r"wall_clock_accumulated: model=LUMEN, seconds=([0-9.]+)", log)
+          profile = re.findall(r"profile_10: forward=([0-9.]+), backward=([0-9.]+), sleep=([0-9.]+), python_overhead=([0-9.]+), total=([0-9.]+)", log)
+          summary = {
+              "hypothesis": os.environ["HYPOTHESIS"],
+              "completed_steps": int(steps[-1][0]),
+              "loss_step_1": float(steps[0][1]),
+              "loss_step_10": float(steps[-1][1]),
+              "trainer_wall_seconds": float(wall[-1]) if wall else None,
+              "profile_10": dict(zip(("forward_s","backward_s","sleep_s","python_overhead_s","total_s"), map(float, profile[-1]))) if profile else None
+          }
+          Path("benchmark-results/summary.json").write_text(json.dumps(summary, indent=2)+"\n")
+          print("BENCHMARK_SUMMARY="+json.dumps(summary, sort_keys=True))
+          PY
+      - name: Upload isolated benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-10step-${{ matrix.hypothesis }}-${{ github.run_id }}
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 1
