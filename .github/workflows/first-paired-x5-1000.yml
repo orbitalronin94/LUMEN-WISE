@@ -34,12 +34,19 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      - name: Download the immutable public V4 artifact
+      - name: Download the frozen V4 artifact from WISE-RONIN
         shell: bash
+        env:
+          WISE_RONIN_READ_TOKEN: ${{ secrets.WISE_RONIN_READ_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${WISE_RONIN_READ_TOKEN:-}" ]; then
+            echo "::error::Missing repository secret WISE_RONIN_READ_TOKEN (fine-grained token with Actions: read on WISE-RONIN)."
+            exit 2
+          fi
           curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${WISE_RONIN_READ_TOKEN}" \
             "https://api.github.com/repos/${SOURCE_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
             --output corpus-v4.zip
           echo "${SOURCE_ARTIFACT_SHA256}  corpus-v4.zip" | sha256sum --check
