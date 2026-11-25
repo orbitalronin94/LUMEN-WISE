@@ -143,8 +143,8 @@ jobs:
             --disable-mkldnn --disable-foreach --cpu-affinity \
             --compile-mode default \
             --lr 3e-5 --warmup 100 --total-steps 1000 \
-            --log-every 1 --checkpoint-every 1000 \
-            --recovery-checkpoint-every 100 --parameter-check-every 100 \
+            --log-every 25 --checkpoint-every 1000 \
+            --recovery-checkpoint-every 25 --parameter-check-every 100 \
             --ckpt-dir checkpoints/lumen \
             --model-config config/lumen_wise_x5_parallel1000.json \
             --runtime-profile config/lumen_cpu_profile.json \
