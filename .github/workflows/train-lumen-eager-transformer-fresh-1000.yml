@@ -1,0 +1,278 @@
+name: LUMEN-WISE — paired fresh LUMEN eager + Transformer CPU train (1000 steps)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/train-lumen-eager-transformer-fresh-1000.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: lumen-wise-paired-eager-transformer-fresh-1000
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  OMP_DYNAMIC: "FALSE"
+  MKL_DYNAMIC: "FALSE"
+  OMP_WAIT_POLICY: "PASSIVE"
+  SOURCE_RELEASE_URL: "https://github.com/orbitalronin94/WISE-RONIN/releases/download/corpus-v4.0.0-public-20261125/wise-ronin-corpus-v4.0.0.zip"
+  SOURCE_RELEASE_SHA256: "535ae5a1c067f30a93e1ad20e0a8b7e332df5b14558d1dfac7a3e44193de3e9a"
+  TOKENIZER_SHA256: "d7869c11809a28085d5156638086c4833a1dcbacfda4a60b69ec71e26ed3fefe"
+
+jobs:
+  prepare-v4:
+    name: Import and verify public V4 corpus
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Download public V4 release (no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            "${SOURCE_RELEASE_URL}" --output corpus-v4.zip
+          echo "${SOURCE_RELEASE_SHA256}  corpus-v4.zip" | sha256sum --check
+          unzip -q corpus-v4.zip
+          test -s corpus/manifest.json
+          test -s corpus/tokenizer.json
+
+      - name: Verify authorization, tokenizer and all 24 shard hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path("corpus")
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          expected = "${{ env.TOKENIZER_SHA256 }}"
+          assert manifest.get("version") == "v4.0.0"
+          assert manifest.get("status") == "FROZEN_TRAINABLE"
+          assert manifest.get("training_authorized") is True
+          assert manifest.get("tokenizer_sha256") == expected
+          assert hashlib.sha256((root / "tokenizer.json").read_bytes()).hexdigest() == expected
+          shards = manifest.get("shards", [])
+          assert len(shards) == 24, len(shards)
+          rows = 0
+          for shard in shards:
+              path = root / shard["file"]
+              assert path.is_file() and path.stat().st_size == int(shard["bytes"])
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              assert digest.hexdigest() == shard["sha256"], shard["file"]
+              rows += int(shard["rows"])
+          assert rows == int(manifest["total_rows"]) == 2_293_883
+          print(f"V4_OK rows={rows} shards={len(shards)} tokenizer={expected}")
+          PY
+
+      - name: Publish verified V4 inputs for both model jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-v4-paired-inputs-${{ github.run_id }}
+          path: corpus/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
+
+  train-lumen-parallel-delta:
+    name: Train LUMEN x5 — parallel Delta — steps 0 to 1000
+    needs: prepare-v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-v4-paired-inputs-${{ github.run_id }}
+          path: corpus
+
+      - name: Install CPU training runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "numpy>=1.26,<3" "tokenizers>=0.20,<1.0" "tqdm>=4.66,<5"
+
+      - name: Verify corpus and generate valid isolated LUMEN config/profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          manifest = json.loads(Path("corpus/manifest.json").read_text(encoding="utf-8"))
+          expected = "${{ env.TOKENIZER_SHA256 }}"
+          assert manifest["training_authorized"] is True
+          assert manifest["status"] == "FROZEN_TRAINABLE"
+          assert manifest["tokenizer_sha256"] == expected
+          assert hashlib.sha256(Path("corpus/tokenizer.json").read_bytes()).hexdigest() == expected
+          assert len(manifest["shards"]) == 24
+          config = json.loads(Path("config/lumen_wise_x5.json").read_text(encoding="utf-8"))
+          config.update({"learning_rate": 3e-5, "warmup_steps": 100,
+                         "batch_size": 8, "sequence_length": 128,
+                         "total_steps": 1000, "seed": 42})
+          config_path = Path("config/lumen_wise_x5_parallel1000.json")
+          config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+          # Parse the file immediately: fail here, not after invoking the trainer.
+          json.loads(config_path.read_text(encoding="utf-8"))
+          profile = json.loads(Path("config/lumen_cpu_profile.json").read_text(encoding="utf-8"))
+          profile["threads"] = 4
+          profile["interop_threads"] = 2
+          Path("config/lumen_cpu_profile_eager1000.json").write_text(
+              json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+          json.loads(Path("config/lumen_cpu_profile_eager1000.json").read_text(encoding="utf-8"))
+          print("LUMEN_CONFIG_OK steps=1000 batch=8 seq=128 seed=42")
+          print("DELTA_MODE=parallel_fixed_point; V32_ZE=off; torch_compile=disabled; cpu_threads=4")
+          PY
+          mkdir -p checkpoints/lumen logs
+          { date -u; nproc; free -h; df -h .; } | tee logs/runner-baseline.txt
+          python -m train.train --help >/dev/null
+
+      - name: Train fresh LUMEN for 1000 steps — eager path selected by 10-hypothesis benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m train.train \
+            --steps 1000 --phase 1 --pilot-all-rows \
+            --data corpus --tokenizer corpus/tokenizer.json \
+            --batch 8 --max-len 128 --seed 42 \
+            --disable-mkldnn --disable-foreach --cpu-affinity \
+            --lr 3e-5 --warmup 100 --total-steps 1000 \
+            --log-every 25 --checkpoint-every 1000 \
+            --recovery-checkpoint-every 25 --parameter-check-every 100 \
+            --ckpt-dir checkpoints/lumen \
+            --model-config config/lumen_wise_x5_parallel1000.json \
+            --runtime-profile config/lumen_cpu_profile_parallel2.json \
+            2>&1 | tee logs/lumen-parallel-delta.log
+
+      - name: Verify LUMEN step-1000 checkpoint
+        run: |
+          python - <<'PY'
+          import json, torch
+          from pathlib import Path
+          path = Path("checkpoints/lumen/step_1000.pt")
+          assert path.is_file() and path.stat().st_size > 0
+          state = torch.load(path, map_location="cpu", weights_only=False)
+          assert int(state["step"]) == 1000
+          assert int(state["params"]) == 12_022_016, state["params"]
+          assert state["v32_ze"] is False and state["pilot_all_rows"] is True
+          assert state["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert all(state.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng", "data_sha256"))
+          assert int(state["training_config"]["total_steps"]) == 1000
+          print("LUMEN_X5_STEP1000_OK params=12022016 delta=parallel_fixed_point v32_ze=false")
+          PY
+
+      - name: Upload LUMEN checkpoint, recovery states and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-eager-step1000-${{ github.run_id }}
+          path: |
+            checkpoints/lumen/
+            logs/
+            config/lumen_wise_x5_parallel1000.json
+            config/lumen_cpu_profile_parallel2.json
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 1
+
+  train-transformer-x5:
+    name: Train Transformer x5 — separate runner — steps 0 to 1000
+    needs: prepare-v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-wise-v4-paired-inputs-${{ github.run_id }}
+          path: corpus
+
+      - name: Install CPU training runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "numpy>=1.26,<3" "tokenizers>=0.20,<1.0" "tqdm>=4.66,<5"
+
+      - name: Verify corpus lineage and prepare isolated Transformer run
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          manifest = json.loads(Path("corpus/manifest.json").read_text(encoding="utf-8"))
+          expected = "${{ env.TOKENIZER_SHA256 }}"
+          assert manifest["training_authorized"] is True
+          assert manifest["status"] == "FROZEN_TRAINABLE"
+          assert manifest["tokenizer_sha256"] == expected
+          assert hashlib.sha256(Path("corpus/tokenizer.json").read_bytes()).hexdigest() == expected
+          assert len(manifest["shards"]) == 24
+          print("TRANSFORMER_INPUT_LINEAGE_OK rows=2293883 shards=24")
+          PY
+          mkdir -p checkpoints/transformer logs
+          { date -u; nproc; free -h; df -h .; } | tee logs/runner-baseline.txt
+          python -m train.transformer_baseline --help >/dev/null
+
+      - name: Train Transformer for 1000 steps on the same V4 corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m train.transformer_baseline --steps 1000 \
+            --data corpus --tokenizer corpus/tokenizer.json \
+            --batch 8 --max-len 128 --seed 42 --threads 2 --interop-threads 2 \
+            --disable-mkldnn --disable-foreach --cpu-affinity \
+            --lr 3e-5 --warmup 100 --total-steps 1000 \
+            --checkpoint-every 1000 --parameter-check-every 100 \
+            --ckpt-dir checkpoints/transformer \
+            --model-dim 488 --heads 8 --ff-width 1569 --residual-groups 51 \
+            2>&1 | tee logs/transformer.log
+
+      - name: Verify exact Transformer x5 step-1000 checkpoint
+        run: |
+          python - <<'PY'
+          import torch
+          state = torch.load("checkpoints/transformer/step_1000.pt", map_location="cpu", weights_only=False)
+          assert int(state["step"]) == 1000
+          assert int(state["params"]) == 12_022_016, state["params"]
+          assert state["model_spec"] == {
+              "model_dim": 488, "heads": 8, "ff_width": 1569,
+              "residual_groups": 51, "layers": 4, "tied_embeddings": True
+          }
+          assert int(state["seed"]) == 42
+          assert int(state["training_config"]["total_steps"]) == 1000
+          assert int(state["training_config"]["batch"]) == 8
+          assert int(state["training_config"]["max_len"]) == 128
+          assert abs(float(state["training_config"]["lr"]) - 3e-5) < 1e-12
+          assert state["tokenizer_sha256"] == "${{ env.TOKENIZER_SHA256 }}"
+          assert all(state.get(k) is not None for k in ("model", "optimizer", "scheduler", "rng", "data_sha256"))
+          print("TRANSFORMER_X5_STEP1000_OK params=12022016")
+          PY
+
+      - name: Upload Transformer checkpoint and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wise-transformer-x5-fresh-step1000-${{ github.run_id }}
+          path: |
+            checkpoints/transformer/
+            logs/
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 1
