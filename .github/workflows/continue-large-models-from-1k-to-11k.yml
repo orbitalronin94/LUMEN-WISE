@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/continue-large-models-from-1k-to-11k.yml'
+      - 'train/train.py'
+      - 'README.md'
+      - 'docs/large-model-training.md'
 
 permissions:
   contents: read
@@ -144,6 +147,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The parent model-config is architectural; explicit CLI training values (especially total-steps=11000) take precedence.
           python -m train.train \
             --steps 10000 --phase 1 --pilot-all-rows \
             --resume parent/lumen/checkpoints/lumen/step_1000.pt \
