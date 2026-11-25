@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -330,11 +331,24 @@ def main():
         model_config_data = json.loads(Path(args.model_config).read_text(encoding="utf-8"))
         CONFIG = LumenConfig(**model_config_data)
         LOG.info("model_config loaded: %s", args.model_config)
-        args.lr = CONFIG.learning_rate
-        args.batch = CONFIG.batch_size
-        args.warmup = CONFIG.warmup_steps
-        args.total_steps = CONFIG.total_steps
-        args.seed = CONFIG.seed
+        # Architecture config supplies defaults, but explicit CLI values must
+        # win. In particular, a parent config saved at step 1000 must not
+        # silently reset an explicitly requested continuation horizon (11k).
+        explicit_cli_options = {
+            argument.split("=", 1)[0]
+            for argument in sys.argv[1:]
+            if argument.startswith("--")
+        }
+        config_defaults = {
+            "--lr": ("lr", CONFIG.learning_rate),
+            "--batch": ("batch", CONFIG.batch_size),
+            "--warmup": ("warmup", CONFIG.warmup_steps),
+            "--total-steps": ("total_steps", CONFIG.total_steps),
+            "--seed": ("seed", CONFIG.seed),
+        }
+        for option, (attribute, config_value) in config_defaults.items():
+            if option not in explicit_cli_options:
+                setattr(args, attribute, config_value)
 
     if args.steps < 1 or (args.steps > 10000 and not args.dummy_m1):
         parser.error("--steps must be between 1 and 10000")
